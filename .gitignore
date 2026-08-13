@@ -1,0 +1,64 @@
+# Python 字节码与运行缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境与包管理器本地状态
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+.pdm-python
+.pdm.toml
+.pdm-build/
+.uv-cache/
+
+# 构建与安装产物
+build/
+dist/
+*.egg-info/
+*.egg
+
+# 测试、覆盖率、类型检查和代码质量缓存
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# 本地配置、密钥和环境变量
+/config.toml
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# CloudflareST 与本工具生成的文件
+result.csv
+updated_sub.yaml
+subscription-backup-*.yaml
+*.log
+*.tmp
+*.temp
+
+# 编辑器与操作系统文件
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 临时备份文件
+*~
+*.bak
+*.swp
+*.swo

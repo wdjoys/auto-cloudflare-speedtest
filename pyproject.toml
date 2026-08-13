@@ -1,0 +1,27 @@
+[project]
+name = "auto-cloudflare-speedtest"
+version = "0.3.0"
+description = "Run CloudflareST and update marked CDN IPs in a subscription"
+authors = [
+    {name = "xiaocao", email = "wdjoys@hotmail.com"},
+]
+dependencies = []
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+
+[project.scripts]
+auto-cfst = "auto_cloudflare_speedtest.run:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+auto_cloudflare_speedtest = ["*.exe", "*.txt", "cfst/*/*"]
+
+[tool.uv]
+package = true

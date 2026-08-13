@@ -1,0 +1,127 @@
+# auto-cloudflare-speedtest
+
+运行 CloudflareST，从测速结果中选择 IP，并替换订阅内容里带编号标记的
+Cloudflare CDN 节点。工具默认只生成本地预览，只有明确使用 `--apply` 才会更新远程订阅。
+
+## 环境要求
+
+- Windows x86_64 或 Linux x86_64；程序会自动选择项目内对应的 CloudflareST
+- Python 3.11 或更高版本
+- 推荐使用 [uv](https://docs.astral.sh/uv/)
+
+## 快速开始
+
+```powershell
+uv sync
+Copy-Item config.example.toml config.toml
+```
+
+编辑 `config.toml`，填写订阅 API 的 `url`，然后检查环境：
+
+```powershell
+uv run auto-cfst check
+```
+
+第一次运行请保持预览模式：
+
+```powershell
+uv run auto-cfst run
+```
+
+也可以显式写成 `uv run auto-cfst run --dry-run`，效果相同。
+
+运行成功后，检查生成的 `updated_sub.yaml`。确认内容正确再提交：
+
+```powershell
+uv run auto-cfst run --apply
+```
+
+使用 `--apply` 时，程序会先在输出文件旁生成带时间戳的原订阅备份。
+
+不安装命令入口也可以这样运行：
+
+```powershell
+uv run python -m auto_cloudflare_speedtest run
+```
+
+## 订阅内容标记
+
+只会替换带有以下编号注释的 `server`。编号必须从 1 开始，并与测速结果顺序对应：
+
+```yaml
+- server: "1.1.1.1" # cloudflare cdn ip 1
+- server: "2606:4700::1111" # cloudflare cdn ip 2
+```
+
+IPv4、IPv6、域名、单双引号和无引号写法均受支持。如果一个标记都没有匹配到，
+程序会停止，不会发起远程更新。
+
+## 配置方式
+
+完整配置见 `config.example.toml`。命令行参数优先级高于配置文件：
+
+```powershell
+uv run auto-cfst run `
+  --url "https://example.com/api/subscription" `
+  --threads 500 `
+  --latency 180 `
+  --download-count 5 `
+  --speed-limit 5
+```
+
+敏感信息推荐放在环境变量中：
+
+```powershell
+$env:CFST_SUBSCRIPTION_URL = "https://example.com/api/subscription"
+$env:CFST_SUBSCRIPTION_TOKEN = "your-token"
+uv run auto-cfst run
+```
+
+查看全部参数：
+
+```powershell
+uv run auto-cfst run --help
+```
+
+常用参数：
+
+- `--config`：配置文件路径，默认 `config.toml`
+- `--executable`：CloudflareST 可执行文件路径
+- `--ip-file`：IPv4 或 IPv6 地址段文件路径
+- `--result`：测速 CSV 路径
+- `--output`：更新后 YAML 路径
+- `--debug`：显示 CloudflareST 下载失败原因，仅限预览模式
+- `--apply`：提交远程更新；未指定时只生成本地预览
+
+## 常见问题
+
+**提示找不到 CloudflareST**
+
+运行 `auto-cfst check` 查看识别到的平台和程序路径。内置二进制采用
+`cfst/<平台>_<架构>/cfst[.exe]` 目录格式，例如 `win_x86_64`、`linux_x86_64`。
+默认 IP 段文件也从该平台目录读取。如果当前平台尚未内置，可通过 `--executable`
+和 `--ip-file` 或配置文件指定外部文件。
+
+**想测试 IPv6**
+
+使用 `--ip-file` 指定当前平台目录下的 `ipv6.txt`，例如 Windows x86_64：
+`--ip-file src/auto_cloudflare_speedtest/cfst/win_x86_64/ipv6.txt`，也可以写入配置文件。
+
+**生成了 CSV，但没有更新**
+
+检查订阅内容是否包含 `# cloudflare cdn ip 1` 这类连续编号标记。程序默认不会更新远程；
+确认预览后还需显式添加 `--apply`。
+
+**下载测速显示 `0 / 10`，并且没有生成 CSV**
+
+说明没有 IP 达到当前的下载速度下限。先使用配置中的 `0.01 MB/s` 再试；如仍无结果，
+运行 `uv run auto-cfst run --debug` 查看 CloudflareST 给出的下载失败原因。调试模式只用于
+诊断，不能与 `--apply` 一起使用。
+
+## 开发与测试
+
+```powershell
+uv run python -m unittest discover -v
+```
+
+CloudflareST 是独立的第三方程序；分发或升级内置二进制文件时，请同时核对其来源、版本和许可证。

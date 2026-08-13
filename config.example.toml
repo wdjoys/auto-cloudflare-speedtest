@@ -1,0 +1,22 @@
+[subscription]
+# 必填。也可以通过 --url 或 CFST_SUBSCRIPTION_URL 设置。
+url = "https://example.com/api/subscription"
+# 不建议把真实令牌写入文件；优先使用 CFST_SUBSCRIPTION_TOKEN。
+# token = ""
+
+[speedtest]
+# 留空或删除 executable 可按操作系统和 CPU 架构自动选择包内二进制文件。
+# 相对路径以 config.toml 所在目录为基准。
+# executable = "D:/tools/CloudflareST/cfst.exe"
+# ip_file = "D:/data/cloudflare-ipv6.txt"
+threads = 1000
+latency = 210
+download_count = 10
+speed_limit = 0.01
+display_count = 0
+# 调试模式只用于排查下载测速失败，不能与 --apply 同时使用。
+debug = false
+
+[output]
+result_csv = "result.csv"
+updated_yaml = "updated_sub.yaml"
