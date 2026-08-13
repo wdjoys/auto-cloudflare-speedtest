@@ -1,7 +1,9 @@
 import csv
 import io
+import os
 import subprocess
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -12,6 +14,7 @@ from auto_cloudflare_speedtest.run import (
     TeeTextIO,
     _bundled_executable,
     _build_parser,
+    _cleanup_expired_logs,
     _default_ip_file,
     _platform_bundle_name,
     get_sub_content,
@@ -19,8 +22,10 @@ from auto_cloudflare_speedtest.run import (
     load_config,
     main,
     replace_server_ips,
+    replace_server_ips_with_details,
     replace_server_ips_with_count,
     run_pipeline,
+    update_subscription,
 )
 
 
@@ -40,6 +45,30 @@ class FakeHttpResponse:
 
 
 class RequestRetryTests(unittest.TestCase):
+    def test_update_requires_response_content_to_match(self) -> None:
+        response = FakeHttpResponse(b'{"data":{"content":"new"}}')
+        with patch(
+            "auto_cloudflare_speedtest.run.urllib.request.urlopen",
+            return_value=response,
+        ):
+            result = update_subscription(
+                {"content": "new"}, "https://example.com", retries=0
+            )
+
+        self.assertEqual(result, {"data": {"content": "new"}})
+
+    def test_update_rejects_mismatched_response_content(self) -> None:
+        response = FakeHttpResponse(b'{"data":{"content":"old"}}')
+        with patch(
+            "auto_cloudflare_speedtest.run.urllib.request.urlopen",
+            return_value=response,
+        ):
+            result = update_subscription(
+                {"content": "new"}, "https://example.com", retries=0
+            )
+
+        self.assertIsNone(result)
+
     def test_retries_connection_reset_then_succeeds(self) -> None:
         response = FakeHttpResponse(b'{"data":{"content":"ok"}}')
         error = urllib.error.URLError(ConnectionResetError(104, "reset"))
@@ -77,6 +106,45 @@ class RequestRetryTests(unittest.TestCase):
 
 
 class ExecutionLogTests(unittest.TestCase):
+    def assert_timestamped_lines(self, content: str, expected_lines: list[str]) -> None:
+        lines = content.splitlines()
+        self.assertEqual(len(lines), len(expected_lines))
+        for line, expected in zip(lines, expected_lines):
+            self.assertRegex(line, r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
+            self.assertTrue(line.endswith(expected), line)
+
+    def test_cleanup_removes_only_expired_generated_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            expired = log_dir / "auto-cfst-old.log"
+            recent = log_dir / "auto-cfst-recent.log"
+            unrelated = log_dir / "application.log"
+            for path in (expired, recent, unrelated):
+                path.write_text("log", encoding="utf-8")
+            old_time = time.time() - 31 * 24 * 60 * 60
+            os.utime(expired, (old_time, old_time))
+
+            deleted, errors = _cleanup_expired_logs(log_dir, 30)
+
+            self.assertEqual(deleted, 1)
+            self.assertEqual(errors, [])
+            self.assertFalse(expired.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_zero_retention_disables_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_dir = Path(directory)
+            expired = log_dir / "auto-cfst-old.log"
+            expired.write_text("log", encoding="utf-8")
+            old_time = time.time() - 365 * 24 * 60 * 60
+            os.utime(expired, (old_time, old_time))
+
+            deleted, errors = _cleanup_expired_logs(log_dir, 0)
+
+            self.assertEqual((deleted, errors), (0, []))
+            self.assertTrue(expired.exists())
+
     def test_carriage_return_progress_keeps_only_last_frame_in_log(self) -> None:
         terminal = io.StringIO()
         log = io.StringIO()
@@ -89,7 +157,9 @@ class ExecutionLogTests(unittest.TestCase):
         output.finalize()
 
         self.assertEqual(terminal.getvalue(), "开始测速\n100 / 100 [---] 可用: 90\n")
-        self.assertEqual(log.getvalue(), "开始测速\n100 / 100 [---] 可用: 90\n")
+        self.assert_timestamped_lines(
+            log.getvalue(), ["开始测速", "100 / 100 [---] 可用: 90"]
+        )
 
     def test_newline_progress_is_also_collapsed(self) -> None:
         terminal = io.StringIO()
@@ -102,9 +172,8 @@ class ExecutionLogTests(unittest.TestCase):
         output.write("开始下载测速\n")
         output.finalize()
 
-        self.assertEqual(
-            log.getvalue().splitlines(),
-            ["100 / 100 [---] 可用: 90", "开始下载测速"],
+        self.assert_timestamped_lines(
+            log.getvalue(), ["100 / 100 [---] 可用: 90", "开始下载测速"]
         )
 
     def test_concatenated_progress_keeps_last_frame(self) -> None:
@@ -115,7 +184,7 @@ class ExecutionLogTests(unittest.TestCase):
         output.write("0 / 100 [___] 可用: 0  50 / 100 [-__] 可用: 45\n")
         output.finalize()
 
-        self.assertEqual(log.getvalue(), "50 / 100 [-__] 可用: 45\n")
+        self.assert_timestamped_lines(log.getvalue(), ["50 / 100 [-__] 可用: 45"])
 
     def test_main_writes_metadata_and_command_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -184,6 +253,19 @@ class PlatformSelectionTests(unittest.TestCase):
 
 
 class ReplaceServerIpsTests(unittest.TestCase):
+    def test_details_distinguish_matches_from_real_changes(self) -> None:
+        content = (
+            'server: "1.1.1.1" # cloudflare cdn ip 1\n'
+            'server: "2.2.2.2" # cloudflare cdn ip 2\n'
+        )
+        updated, matched, changes = replace_server_ips_with_details(
+            content, ["1.1.1.1", "8.8.8.8"]
+        )
+
+        self.assertEqual(matched, 2)
+        self.assertEqual(changes, [(2, "2.2.2.2", "8.8.8.8")])
+        self.assertIn("8.8.8.8", updated)
+
     def test_replaces_ipv4_ipv6_and_unquoted_hosts(self) -> None:
         content = """proxies:
   - server: "old.example.com" # cloudflare cdn ip 1
@@ -237,6 +319,44 @@ class ConfigTests(unittest.TestCase):
 
 
 class PipelineSafetyTests(unittest.TestCase):
+    def test_unchanged_content_writes_current_preview_without_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            preview_path = root / "preview.yaml"
+            config_path.write_text(
+                '[subscription]\nurl = "https://example.com/api"\n'
+                '[output]\nupdated_yaml = "preview.yaml"\nresult_csv = "result.csv"\n',
+                encoding="utf-8",
+            )
+            preview_path.write_text("stale", encoding="utf-8")
+            args = _build_parser().parse_args(
+                ["run", "--config", str(config_path), "--apply"]
+            )
+            content = 'server: "1.1.1.1" # cloudflare cdn ip 1\n'
+            subscription = {"data": {"content": content}}
+
+            with (
+                patch(
+                    "auto_cloudflare_speedtest.run.get_sub_content",
+                    return_value=subscription,
+                ),
+                patch(
+                    "auto_cloudflare_speedtest.run.run_cfst_speedtest",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ),
+                patch(
+                    "auto_cloudflare_speedtest.run.extract_ips_from_csv",
+                    return_value=["1.1.1.1"],
+                ),
+                patch("auto_cloudflare_speedtest.run.update_subscription") as update,
+            ):
+                result = run_pipeline(args)
+
+            self.assertEqual(result, ExitCode.OK)
+            self.assertEqual(preview_path.read_text(encoding="utf-8"), content)
+            update.assert_not_called()
+
     def test_default_mode_writes_preview_without_remote_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

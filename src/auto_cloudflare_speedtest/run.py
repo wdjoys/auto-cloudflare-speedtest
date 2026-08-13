@@ -4,6 +4,7 @@ import argparse
 import codecs
 import contextlib
 import csv
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -17,6 +18,7 @@ import sys
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from enum import IntEnum
@@ -65,6 +67,14 @@ class TeeTextIO:
     def _clean_line(self, line: str) -> str:
         return self.ANSI_ESCAPE.sub("", line).rstrip()
 
+    def _write_log_line(self, line: str) -> None:
+        """日志中的非空行增加精确到秒的本地时间，空行原样保留。"""
+        if line:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.log_file.write(f"[{timestamp}] {line}\n")
+        else:
+            self.log_file.write("\n")
+
     def _extract_progress(self, line: str) -> str | None:
         """提取最后一个进度帧，兼容多个帧被拼在同一行的情况。"""
         matches = list(self.PROGRESS_START.finditer(line))
@@ -87,7 +97,7 @@ class TeeTextIO:
             self.terminal.write(f"\r{self._latest_progress}\x1b[K\n")
         else:
             self.terminal.write(f"{self._latest_progress}\n")
-        self.log_file.write(f"{self._latest_progress}\n")
+        self._write_log_line(self._latest_progress)
         self._latest_progress = None
         self._progress_visible = False
 
@@ -112,7 +122,7 @@ class TeeTextIO:
         if not clean_line and (is_carriage_return or committed_progress):
             return
         self.terminal.write(f"{clean_line}\n")
-        self.log_file.write(f"{clean_line}\n")
+        self._write_log_line(clean_line)
 
     def finalize(self) -> None:
         """将最后一行写入日志，避免无换行输出丢失。"""
@@ -369,6 +379,8 @@ def _request_headers(token: str | None = None) -> dict[str, str]:
     headers = {
         "User-Agent": "auto-cloudflare-speedtest/0.2",
         "Accept": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -422,12 +434,19 @@ def get_sub_content(
     retries: int = 5,
     retry_delay: float = 2,
     timeout: float = 30,
+    cache_bust: bool = False,
 ) -> Optional[dict[str, Any]]:
     """读取远程订阅 JSON。"""
     print(f"正在获取订阅内容: {url}")
     try:
+        request_url = url
+        if cache_bust:
+            separator = "&" if urllib.parse.urlsplit(url).query else "?"
+            request_url = f"{url}{separator}_auto_cfst_verify={time.time_ns()}"
         _, response_body = _request_with_retry(
-            lambda: urllib.request.Request(url, headers=_request_headers(token)),
+            lambda: urllib.request.Request(
+                request_url, headers=_request_headers(token)
+            ),
             timeout=timeout,
             retries=retries,
             retry_delay=retry_delay,
@@ -456,9 +475,12 @@ def get_sub_content(
     return None
 
 
-def replace_server_ips_with_count(content: str, ips: list[str]) -> tuple[str, int]:
-    """按编号标记替换 server，兼容 IPv4、IPv6、域名及单双引号。"""
-    replaced = 0
+def replace_server_ips_with_details(
+    content: str, ips: list[str]
+) -> tuple[str, int, list[tuple[int, str, str]]]:
+    """按编号替换 server，并区分匹配数与真实变化数。"""
+    matched = 0
+    changes: list[tuple[int, str, str]] = []
     for index, ip in enumerate(ips, start=1):
         pattern = re.compile(
             rf"(?P<prefix>\bserver\s*:\s*)(?P<quote>[\"']?)(?P<host>[^\s#\"']+)"
@@ -467,14 +489,23 @@ def replace_server_ips_with_count(content: str, ips: list[str]) -> tuple[str, in
         )
 
         def replacer(match: re.Match[str]) -> str:
+            old_host = match.group("host")
+            if old_host != ip:
+                changes.append((index, old_host, ip))
             return (
                 f"{match.group('prefix')}{match.group('quote')}{ip}"
                 f"{match.group('quote')}{match.group('suffix')}"
             )
 
         content, count = pattern.subn(replacer, content, count=1)
-        replaced += count
-    return content, replaced
+        matched += count
+    return content, matched, changes
+
+
+def replace_server_ips_with_count(content: str, ips: list[str]) -> tuple[str, int]:
+    """兼容旧调用方式，返回匹配的标记数量。"""
+    updated, matched, _ = replace_server_ips_with_details(content, ips)
+    return updated, matched
 
 
 def replace_server_ips(content: str, ips: list[str]) -> str:
@@ -489,13 +520,13 @@ def update_subscription(
     retries: int = 5,
     retry_delay: float = 2,
     timeout: float = 30,
-) -> bool:
+) -> Optional[dict[str, Any]]:
     """通过 PATCH 更新远程订阅。"""
     headers = _request_headers(token)
     headers["Content-Type"] = "application/json; charset=utf-8"
     data_bytes = json.dumps(content, ensure_ascii=False).encode("utf-8")
     try:
-        status, _ = _request_with_retry(
+        status, response_body = _request_with_retry(
             lambda: urllib.request.Request(
                 url=url,
                 data=data_bytes,
@@ -508,7 +539,24 @@ def update_subscription(
             operation="更新订阅",
         )
         if 200 <= status < 300:
-            return True
+            try:
+                response_data = json.loads(response_body.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                print(f"错误: 更新接口返回的不是有效 JSON: {exc}")
+                return None
+            if not isinstance(response_data, dict):
+                print("错误: 更新接口没有返回 JSON 对象。")
+                return None
+            returned_data = response_data.get("data")
+            returned_content = (
+                returned_data.get("content")
+                if isinstance(returned_data, dict)
+                else None
+            )
+            if returned_content != content.get("content"):
+                print("错误: PATCH 响应中的 data.content 与提交内容不一致。")
+                return None
+            return response_data
         print(f"错误: 更新订阅失败，HTTP 状态码: {status}")
     except urllib.error.HTTPError as exc:
         print(f"错误: 更新订阅失败，HTTP {exc.code}: {exc.reason}")
@@ -518,7 +566,11 @@ def update_subscription(
         print(f"错误: 订阅 URL 或请求内容无效: {exc}")
     except OSError as exc:
         print(f"错误: 发送更新请求失败: {exc}")
-    return False
+    return None
+
+
+def _content_digest(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
 
 
 def _nested(config: dict[str, Any], section: str, key: str, default: Any) -> Any:
@@ -743,13 +795,24 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
         print("错误: 测速没有产生有效 IP，已停止更新。")
         return ExitCode.SPEEDTEST_FAILED
 
-    updated_content, replaced = replace_server_ips_with_count(original_content, ips)
-    if replaced == 0:
+    updated_content, matched, changes = replace_server_ips_with_details(
+        original_content, ips
+    )
+    if matched == 0:
         print("错误: 未找到 '# cloudflare cdn ip N' 标记，已停止更新。")
         return ExitCode.REPLACE_FAILED
-    print(f"已替换 {replaced} 个 server 地址（测速结果共 {len(ips)} 个）。")
-    if replaced < len(ips):
-        print(f"提示: 有 {len(ips) - replaced} 个 IP 没有对应的编号标记，已忽略。")
+    print(
+        f"匹配 {matched} 个 server 标记，实际变化 {len(changes)} 个"
+        f"（测速结果共 {len(ips)} 个）。"
+    )
+    for index, old_host, new_host in changes:
+        print(f"  #{index}: {old_host} -> {new_host}")
+    if matched < len(ips):
+        print(f"提示: 有 {len(ips) - matched} 个 IP 没有对应的编号标记，已忽略。")
+    print(
+        f"内容校验: 更新前 sha256={_content_digest(original_content)}，"
+        f"更新后 sha256={_content_digest(updated_content)}"
+    )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -758,6 +821,10 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
         print(f"错误: 无法保存预览文件 {output_file}: {exc}")
         return ExitCode.REPLACE_FAILED
     print(f"更新后的完整内容已保存到: {output_file}")
+
+    if not changes or updated_content == original_content:
+        print("测速 IP 与远程订阅中的 server 地址一致，无需更新；未发送 PATCH。")
+        return ExitCode.OK
 
     if not args.apply:
         print("预览模式：没有修改远程订阅。确认文件后使用 --apply 提交。")
@@ -773,16 +840,38 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
     print(f"远程更新前的原内容已备份到: {backup_file}")
 
     subscription["data"]["content"] = updated_content
-    if not update_subscription(
+    patch_response = update_subscription(
         subscription["data"],
         url,
         token or None,
         retries=retries,
         retry_delay=retry_delay,
         timeout=request_timeout,
-    ):
+    )
+    if patch_response is None:
         return ExitCode.SUBSCRIPTION_UPDATE_FAILED
-    print("订阅更新成功。")
+
+    print("PATCH 响应校验通过，正在重新读取远程订阅进行最终验证...")
+    verified_subscription = get_sub_content(
+        url,
+        token or None,
+        retries=retries,
+        retry_delay=retry_delay,
+        timeout=request_timeout,
+        cache_bust=True,
+    )
+    if verified_subscription is None:
+        print("错误: PATCH 后无法重新读取订阅，不能确认远程更新是否生效。")
+        return ExitCode.SUBSCRIPTION_UPDATE_FAILED
+    remote_content = verified_subscription["data"]["content"]
+    if remote_content != updated_content:
+        print("错误: PATCH 返回成功，但重新 GET 后远程 data.content 与提交内容不一致。")
+        print(
+            f"提交 sha256={_content_digest(updated_content)}，"
+            f"远程 sha256={_content_digest(remote_content)}"
+        )
+        return ExitCode.SUBSCRIPTION_UPDATE_FAILED
+    print(f"订阅更新成功并已验证，远程 sha256={_content_digest(remote_content)}。")
     return ExitCode.OK
 
 
@@ -792,7 +881,7 @@ def _execute_command(args: argparse.Namespace) -> int:
     return int(run_pipeline(args))
 
 
-def _log_settings(args: argparse.Namespace) -> tuple[bool, Path]:
+def _log_settings(args: argparse.Namespace) -> tuple[bool, Path, Path, int]:
     """读取日志设置；日志自身初始化失败不能阻止核心任务执行。"""
     config_path = _resolve_path(args.config)
     try:
@@ -804,22 +893,52 @@ def _log_settings(args: argparse.Namespace) -> tuple[bool, Path]:
     if args.no_log:
         enabled = False
 
+    log_dir_value = _nested(config, "output", "log_dir", "logs")
+    try:
+        log_dir = _resolve_path(log_dir_value, config_path.parent)
+    except (TypeError, ValueError, OSError):
+        log_dir = _resolve_path("logs", config_path.parent)
+
+    retention_value = _nested(config, "output", "log_retention_days", 30)
+    try:
+        retention_days = max(0, int(retention_value))
+    except (TypeError, ValueError):
+        retention_days = 30
+
     if args.log_file is not None:
         log_path = _resolve_path(args.log_file, config_path.parent)
     else:
-        log_dir_value = _nested(config, "output", "log_dir", "logs")
-        try:
-            log_dir = _resolve_path(log_dir_value, config_path.parent)
-        except (TypeError, ValueError, OSError):
-            log_dir = _resolve_path("logs", config_path.parent)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         log_path = log_dir / f"auto-cfst-{timestamp}.log"
-    return enabled, log_path
+    return enabled, log_path, log_dir, retention_days
+
+
+def _cleanup_expired_logs(log_dir: Path, retention_days: int) -> tuple[int, list[str]]:
+    """删除日志目录内超过保留期的本程序日志，不触碰其他文件。"""
+    if retention_days <= 0 or not log_dir.is_dir():
+        return 0, []
+
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    deleted = 0
+    errors: list[str] = []
+    try:
+        candidates = list(log_dir.glob("auto-cfst-*.log"))
+    except OSError as exc:
+        return 0, [f"无法扫描日志目录 {log_dir}: {exc}"]
+
+    for path in candidates:
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                deleted += 1
+        except OSError as exc:
+            errors.append(f"无法删除过期日志 {path}: {exc}")
+    return deleted, errors
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    enabled, log_path = _log_settings(args)
+    enabled, log_path, log_dir, retention_days = _log_settings(args)
     if not enabled:
         return _execute_command(args)
 
@@ -838,6 +957,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"日志文件: {log_path}")
             print(f"开始时间: {started_at.isoformat(timespec='seconds')}")
             print(f"运行平台: {platform.system()} {platform.machine()}")
+            deleted_logs, cleanup_errors = _cleanup_expired_logs(
+                log_dir, retention_days
+            )
+            if retention_days > 0:
+                print(f"日志保留期: {retention_days} 天，本次清理 {deleted_logs} 个过期日志。")
+            else:
+                print("日志自动清理: 已关闭。")
+            for cleanup_error in cleanup_errors:
+                print(f"警告: {cleanup_error}")
             try:
                 exit_code = _execute_command(args)
             except KeyboardInterrupt:
