@@ -5,6 +5,11 @@
 # 订阅管理接口地址；沿用原脚本中内置的 GET/PATCH API 地址。 sub-store 订阅
 url = "https://sub.store/store密码/api/sub/订阅名称"
 
+# 客户端实际使用的订阅下载地址，用于 PATCH 后验证新 IP 已真正生效。
+# Sub-Store 的 /api/sub/ 地址可自动推导为 /download/，通常无需配置；
+# 若客户端使用分享链接、组合订阅或带 target 参数的地址，请取消注释并填写完整链接。
+# download_url = "https://sub.store/store密码/download/订阅名称"
+
 # 接口认证令牌；原脚本没有配置令牌，因此默认不启用。
 # 如接口需要认证，推荐设置环境变量 CFST_SUBSCRIPTION_TOKEN，
 # 或取消下一行注释并填写令牌（请勿将包含真实令牌的配置文件提交到仓库）。

@@ -1,3 +1,4 @@
+import base64
 import csv
 import io
 import os
@@ -6,6 +7,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,10 +20,13 @@ from auto_cloudflare_speedtest.run import (
     _cleanup_expired_backups,
     _default_ip_file,
     _platform_bundle_name,
+    derive_download_url,
+    get_download_content,
     get_sub_content,
     extract_ips_from_csv,
     load_config,
     main,
+    missing_download_hosts,
     replace_server_ips,
     replace_server_ips_with_details,
     replace_server_ips_with_count,
@@ -46,6 +51,38 @@ class FakeHttpResponse:
 
 
 class RequestRetryTests(unittest.TestCase):
+    def test_derives_sub_store_download_url(self) -> None:
+        self.assertEqual(
+            derive_download_url(
+                "https://example.com/key/api/sub/%E8%87%AA%E5%BB%BA?x=1"
+            ),
+            "https://example.com/key/download/%E8%87%AA%E5%BB%BA?x=1",
+        )
+        self.assertIsNone(derive_download_url("https://example.com/custom/api"))
+
+    def test_download_verification_bypasses_cache(self) -> None:
+        response = FakeHttpResponse(b"server: 8.8.8.8")
+        with patch(
+            "auto_cloudflare_speedtest.run.urllib.request.urlopen",
+            return_value=response,
+        ) as urlopen:
+            result = get_download_content(
+                "https://example.com/download/test?target=Clash", retries=0
+            )
+
+        self.assertEqual(result, "server: 8.8.8.8")
+        request = urlopen.call_args.args[0]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+        self.assertEqual(query["noCache"], ["true"])
+        self.assertIn("_auto_cfst_verify", query)
+        self.assertTrue(request.headers["User-agent"].startswith("Clash/"))
+
+    def test_finds_hosts_in_plain_and_base64_downloads(self) -> None:
+        hosts = ["1.1.1.1", "8.8.8.8"]
+        self.assertEqual(missing_download_hosts("server: 1.1.1.1", hosts), ["8.8.8.8"])
+        encoded = base64.b64encode(b"server: 1.1.1.1\nserver: 8.8.8.8").decode()
+        self.assertEqual(missing_download_hosts(encoded, hosts), [])
+
     def test_update_requires_response_content_to_match(self) -> None:
         response = FakeHttpResponse(b'{"data":{"content":"new"}}')
         with patch(
@@ -338,6 +375,54 @@ class ConfigTests(unittest.TestCase):
 
 
 class PipelineSafetyTests(unittest.TestCase):
+    def test_apply_verifies_management_api_and_download_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                '[subscription]\nurl = "https://example.com/key/api/sub/test"\n'
+                '[output]\nupdated_yaml = "preview.yaml"\nresult_csv = "result.csv"\n',
+                encoding="utf-8",
+            )
+            args = _build_parser().parse_args(
+                ["run", "--config", str(config_path), "--apply"]
+            )
+            original = 'server: "1.1.1.1" # cloudflare cdn ip 1\n'
+            updated = 'server: "8.8.8.8" # cloudflare cdn ip 1\n'
+
+            with (
+                patch(
+                    "auto_cloudflare_speedtest.run.get_sub_content",
+                    side_effect=[
+                        {"data": {"name": "test", "content": original}},
+                        {"data": {"name": "test", "content": updated}},
+                    ],
+                ),
+                patch(
+                    "auto_cloudflare_speedtest.run.run_cfst_speedtest",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ),
+                patch(
+                    "auto_cloudflare_speedtest.run.extract_ips_from_csv",
+                    return_value=["8.8.8.8"],
+                ),
+                patch(
+                    "auto_cloudflare_speedtest.run.update_subscription",
+                    return_value={"data": {"name": "test", "content": updated}},
+                ),
+                patch(
+                    "auto_cloudflare_speedtest.run.get_download_content",
+                    return_value="proxies:\n  - server: 8.8.8.8\n",
+                ) as download,
+            ):
+                result = run_pipeline(args)
+
+            self.assertEqual(result, ExitCode.OK)
+            self.assertEqual(
+                download.call_args.args[0],
+                "https://example.com/key/download/test",
+            )
+
     def test_unchanged_content_writes_current_preview_without_patch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

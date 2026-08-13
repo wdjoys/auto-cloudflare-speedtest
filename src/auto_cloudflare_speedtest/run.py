@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import codecs
 import contextlib
 import csv
@@ -475,6 +477,79 @@ def get_sub_content(
     return None
 
 
+def derive_download_url(api_url: str) -> str | None:
+    """从 Sub-Store 的管理 API 地址推导真实订阅下载地址。"""
+    parsed = urllib.parse.urlsplit(api_url)
+    marker = "/api/sub/"
+    if marker not in parsed.path:
+        return None
+    path = parsed.path.replace(marker, "/download/", 1)
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
+    )
+
+
+def get_download_content(
+    url: str,
+    token: str | None = None,
+    retries: int = 5,
+    retry_delay: float = 2,
+    timeout: float = 30,
+) -> str | None:
+    """绕过 Sub-Store 缓存读取客户端实际使用的订阅内容。"""
+    print(f"正在验证订阅下载链接: {url}")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(key, value) for key, value in query if key != "_auto_cfst_verify"]
+        if not any(key == "noCache" for key, _ in query):
+            query.append(("noCache", "true"))
+        query.append(("_auto_cfst_verify", str(time.time_ns())))
+        request_url = urllib.parse.urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                urllib.parse.urlencode(query),
+                parsed.fragment,
+            )
+        )
+        headers = _request_headers(token)
+        headers["User-Agent"] = "Clash/auto-cloudflare-speedtest"
+        headers["Accept"] = "text/plain, application/yaml, application/json"
+        _, response_body = _request_with_retry(
+            lambda: urllib.request.Request(request_url, headers=headers),
+            timeout=timeout,
+            retries=retries,
+            retry_delay=retry_delay,
+            operation="验证订阅下载链接",
+        )
+        return response_body.decode("utf-8-sig")
+    except urllib.error.HTTPError as exc:
+        print(f"错误: 订阅下载链接读取失败，HTTP {exc.code}: {exc.reason}")
+    except urllib.error.URLError as exc:
+        print(f"错误: 无法连接订阅下载链接: {exc.reason}")
+    except (TypeError, ValueError) as exc:
+        print(f"错误: 订阅下载 URL 无效: {exc}")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"错误: 读取订阅下载内容失败: {exc}")
+    return None
+
+
+def missing_download_hosts(content: str, hosts: list[str]) -> list[str]:
+    """返回下载内容中缺少的新地址，并兼容整体 Base64 编码的订阅。"""
+    candidates = [content]
+    compact = "".join(content.split())
+    if compact:
+        try:
+            padding = "=" * (-len(compact) % 4)
+            decoded = base64.b64decode(compact + padding, validate=True).decode("utf-8")
+            candidates.append(decoded)
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            pass
+    return [host for host in hosts if not any(host in item for item in candidates)]
+
+
 def replace_server_ips_with_details(
     content: str, ips: list[str]
 ) -> tuple[str, int, list[tuple[int, str, str]]]:
@@ -591,6 +666,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="运行测速并生成或提交订阅更新")
     run_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     run_parser.add_argument("--url", help="订阅 API 地址（也可使用 CFST_SUBSCRIPTION_URL）")
+    run_parser.add_argument(
+        "--download-url",
+        help="客户端订阅下载地址；Sub-Store 地址默认可从管理 API 自动推导",
+    )
     run_parser.add_argument("--token", help="认证令牌（建议使用 CFST_SUBSCRIPTION_TOKEN）")
     run_parser.add_argument("--retries", type=int, help="临时网络错误的重试次数")
     run_parser.add_argument("--retry-delay", type=float, help="首次重试等待秒数，后续指数增加")
@@ -689,6 +768,11 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
     base_dir = config_path.parent
     url = args.url or os.getenv("CFST_SUBSCRIPTION_URL") or _nested(config, "subscription", "url", "")
     token = args.token or os.getenv("CFST_SUBSCRIPTION_TOKEN") or _nested(config, "subscription", "token", "")
+    configured_download_url = (
+        args.download_url
+        or os.getenv("CFST_SUBSCRIPTION_DOWNLOAD_URL")
+        or _nested(config, "subscription", "download_url", "")
+    )
     if not isinstance(url, str) or not url:
         print("错误: 未配置订阅 URL。请复制 config.example.toml 为 config.toml 并填写 url，")
         print("或使用 --url / CFST_SUBSCRIPTION_URL。")
@@ -699,6 +783,15 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
     if token and not isinstance(token, str):
         print("错误: subscription.token 必须是字符串。")
         return ExitCode.CONFIG_ERROR
+    if configured_download_url and not isinstance(configured_download_url, str):
+        print("错误: subscription.download_url 必须是字符串。")
+        return ExitCode.CONFIG_ERROR
+    if configured_download_url and not configured_download_url.lower().startswith(
+        ("http://", "https://")
+    ):
+        print("错误: 订阅下载 URL 必须以 http:// 或 https:// 开头。")
+        return ExitCode.CONFIG_ERROR
+    download_url = configured_download_url or derive_download_url(url)
 
     try:
         retries = int(_value(args.retries, config, "subscription", "retries", 5))
@@ -875,7 +968,32 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
             f"远程 sha256={_content_digest(remote_content)}"
         )
         return ExitCode.SUBSCRIPTION_UPDATE_FAILED
-    print(f"订阅更新成功并已验证，远程 sha256={_content_digest(remote_content)}。")
+    print(f"管理接口更新成功并已验证，远程 sha256={_content_digest(remote_content)}。")
+    if download_url:
+        downloaded_content = get_download_content(
+            download_url,
+            token or None,
+            retries=retries,
+            retry_delay=retry_delay,
+            timeout=request_timeout,
+        )
+        if downloaded_content is None:
+            print("错误: 管理接口已更新，但无法验证客户端订阅下载链接。")
+            return ExitCode.SUBSCRIPTION_UPDATE_FAILED
+        expected_hosts = [new_host for _, _, new_host in changes]
+        missing_hosts = missing_download_hosts(downloaded_content, expected_hosts)
+        if missing_hosts:
+            print("错误: 管理接口已更新，但订阅下载内容缺少以下新地址：")
+            for host in missing_hosts:
+                print(f"  - {host}")
+            return ExitCode.SUBSCRIPTION_UPDATE_FAILED
+        print(
+            f"订阅下载链接验证通过，{len(expected_hosts)} 个新地址均已生效，"
+            f"下载内容 sha256={_content_digest(downloaded_content)}。"
+        )
+    else:
+        print("提示: 无法从管理 API 推导下载链接，已跳过客户端订阅内容校验。")
+        print("可配置 subscription.download_url 或使用 --download-url 启用校验。")
     return ExitCode.OK
 
 

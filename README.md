@@ -38,8 +38,9 @@ uv run auto-cfst run --apply
 
 使用 `--apply` 时，程序会先在输出文件旁生成带时间戳的原订阅备份。
 提交前会列出每个实际变化的 `旧 server -> 新 server` 并显示内容哈希；PATCH 后既校验
-接口响应，又重新 GET 远程订阅逐字确认。只有远程 `data.content` 与提交内容完全一致时，
-才会报告更新成功。如果测速 IP 与原 server 全部相同，则明确提示无需更新。
+接口响应，又重新 GET 远程订阅逐字确认，最后绕过缓存读取客户端实际使用的下载链接，
+检查每个新 IP 是否出现。三步全部通过才会报告更新成功。如果测速 IP 与原 server 全部
+相同，则明确提示无需更新。
 
 不安装命令入口也可以这样运行：
 
@@ -66,6 +67,7 @@ IPv4、IPv6、域名、单双引号和无引号写法均受支持。如果一个
 ```powershell
 uv run auto-cfst run `
   --url "https://example.com/api/subscription" `
+  --download-url "https://example.com/download/subscription" `
   --threads 500 `
   --latency 180 `
   --download-count 5 `
@@ -76,6 +78,7 @@ uv run auto-cfst run `
 
 ```powershell
 $env:CFST_SUBSCRIPTION_URL = "https://example.com/api/subscription"
+$env:CFST_SUBSCRIPTION_DOWNLOAD_URL = "https://example.com/download/subscription"
 $env:CFST_SUBSCRIPTION_TOKEN = "your-token"
 uv run auto-cfst run
 ```
@@ -89,6 +92,7 @@ uv run auto-cfst run --help
 常用参数：
 
 - `--config`：配置文件路径，默认 `config.toml`
+- `--download-url`：客户端实际使用的订阅链接，用于提交后的最终验证
 - `--executable`：CloudflareST 可执行文件路径
 - `--ip-file`：IPv4 或 IPv6 地址段文件路径
 - `--result`：测速 CSV 路径
@@ -131,6 +135,12 @@ uv run auto-cfst run --help
 这是订阅服务器或中间网络临时断开连接。程序默认会自动重试 5 次，等待时间依次为
 2、4、8、15、15 秒；HTTP 4xx 配置或权限错误不会盲目重试。可在配置文件中调整
 `retries`、`retry_delay` 和 `request_timeout`。
+
+**管理接口显示成功，但客户端订阅看起来没有变化**
+
+对于 Sub-Store，程序会把 `/api/sub/订阅名` 自动转换成 `/download/订阅名`，追加
+`noCache=true` 后检查本次产生的全部新 IP。若客户端使用分享链接、组合订阅或带
+`target` 参数的链接，请在 `subscription.download_url` 中填写客户端的完整地址。
 
 ## 执行日志
 
