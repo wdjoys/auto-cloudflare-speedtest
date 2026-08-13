@@ -1,22 +1,48 @@
+# auto-cloudflare-speedtest 本地配置文件。
+# 命令行参数的优先级高于本文件；相对路径均以本文件所在目录为基准。
+
 [subscription]
-# 必填。也可以通过 --url 或 CFST_SUBSCRIPTION_URL 设置。
-url = "https://example.com/api/subscription"
-# 不建议把真实令牌写入文件；优先使用 CFST_SUBSCRIPTION_TOKEN。
-# token = ""
+# 订阅管理接口地址；沿用原脚本中内置的 GET/PATCH API 地址。 sub-store 订阅
+url = ""
+
+# 接口认证令牌；原脚本没有配置令牌，因此默认不启用。
+# 如接口需要认证，推荐设置环境变量 CFST_SUBSCRIPTION_TOKEN，
+# 或取消下一行注释并填写令牌（请勿将包含真实令牌的配置文件提交到仓库）。
+# token = "your-token"
 
 [speedtest]
-# 留空或删除 executable 可按操作系统和 CPU 架构自动选择包内二进制文件。
-# 相对路径以 config.toml 所在目录为基准。
+# CloudflareST 可执行文件路径。默认不配置，程序会根据操作系统和 CPU 架构，
+# 自动选择 cfst/<平台>_<架构>/cfst[.exe]；只有使用外部程序时才取消下一行注释。
 # executable = "D:/tools/CloudflareST/cfst.exe"
-# ip_file = "D:/data/cloudflare-ipv6.txt"
+
+# 待测速的 IP 地址段文件。默认不配置时，会使用所选 CloudflareST 同目录的 ip.txt。
+# 如需测试 IPv6，可通过 --ip-file 指定对应平台目录内的 ipv6.txt，
+# 或取消下一行注释并填写自定义地址段文件路径。
+# ip_file = ""
+
+# 延迟测速线程数；沿用原脚本默认值 1000。
 threads = 1000
+
+# 可接受的平均延迟上限，单位为毫秒；沿用原脚本默认值 210。
 latency = 210
+
+# 进入下载测速阶段的 IP 数量；原主流程显式使用 10。
 download_count = 10
+
+# 下载速度下限，单位为 MB/s。原脚本使用 3，但当前网络没有 IP 达标，
+# 因此调整为 CloudflareST 文档建议的 0.01，用于过滤下载速度为 0 的回源 IP。
 speed_limit = 0.01
+
+# CloudflareST 在终端显示的结果数量；0 表示不额外显示结果表格。
 display_count = 0
-# 调试模式只用于排查下载测速失败，不能与 --apply 同时使用。
+
+# 是否开启 CloudflareST 调试模式；正常运行保持 false。
+# 调试模式可能输出未达到速度门槛的结果，所以程序禁止它与 --apply 同时使用。
 debug = false
 
 [output]
+# CloudflareST 测速结果 CSV 文件；每次运行会由测速程序更新。
 result_csv = "result.csv"
+
+# 替换 IP 后生成的本地订阅预览文件；未使用 --apply 时只写此文件。
 updated_yaml = "updated_sub.yaml"
