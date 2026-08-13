@@ -145,6 +145,11 @@ CloudflareST 使用回车覆盖同一行刷新进度；日志会压缩这些动�
 `auto-cfst-*.log` 的文件，不会清理其他文件。可通过 `log_retention_days` 修改保留天数，
 设为 `0` 可关闭自动清理。
 
+远程更新前的原订阅统一保存在 `backups/`，文件名为
+`subscription-backup-YYYYMMDD-HHMMSS.yaml`。备份与日志共用 `log_retention_days` 保留期；
+清理仅匹配 `subscription-backup-*.yaml`，不会删除备份目录中的其他文件。即使使用
+`--no-log` 关闭本次日志，备份清理仍会执行。
+
 ```bash
 # 指定日志文件
 python3 src/auto_cloudflare_speedtest/run.py run --log-file /var/log/auto-cfst.log

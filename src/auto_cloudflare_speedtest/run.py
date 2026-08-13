@@ -729,6 +729,9 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
             _value(args.output, config, "output", "updated_yaml", "updated_sub.yaml"),
             base_dir,
         )
+        backup_dir = _resolve_path(
+            _nested(config, "output", "backup_dir", "backups"), base_dir
+        )
         threads = int(_value(args.threads, config, "speedtest", "threads", 1000))
         latency = int(_value(args.latency, config, "speedtest", "latency", 210))
         download_count = int(
@@ -831,8 +834,9 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
         return ExitCode.OK
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_file = output_file.with_name(f"subscription-backup-{timestamp}.yaml")
+    backup_file = backup_dir / f"subscription-backup-{timestamp}.yaml"
     try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
         backup_file.write_text(original_content, encoding="utf-8")
     except OSError as exc:
         print(f"错误: 无法创建备份 {backup_file}: {exc}")
@@ -881,8 +885,8 @@ def _execute_command(args: argparse.Namespace) -> int:
     return int(run_pipeline(args))
 
 
-def _log_settings(args: argparse.Namespace) -> tuple[bool, Path, Path, int]:
-    """读取日志设置；日志自身初始化失败不能阻止核心任务执行。"""
+def _storage_settings(args: argparse.Namespace) -> tuple[bool, Path, Path, Path, int]:
+    """读取日志、备份目录和共同保留期。"""
     config_path = _resolve_path(args.config)
     try:
         config = load_config(config_path)
@@ -899,6 +903,12 @@ def _log_settings(args: argparse.Namespace) -> tuple[bool, Path, Path, int]:
     except (TypeError, ValueError, OSError):
         log_dir = _resolve_path("logs", config_path.parent)
 
+    backup_dir_value = _nested(config, "output", "backup_dir", "backups")
+    try:
+        backup_dir = _resolve_path(backup_dir_value, config_path.parent)
+    except (TypeError, ValueError, OSError):
+        backup_dir = _resolve_path("backups", config_path.parent)
+
     retention_value = _nested(config, "output", "log_retention_days", 30)
     try:
         retention_days = max(0, int(retention_value))
@@ -910,21 +920,23 @@ def _log_settings(args: argparse.Namespace) -> tuple[bool, Path, Path, int]:
     else:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         log_path = log_dir / f"auto-cfst-{timestamp}.log"
-    return enabled, log_path, log_dir, retention_days
+    return enabled, log_path, log_dir, backup_dir, retention_days
 
 
-def _cleanup_expired_logs(log_dir: Path, retention_days: int) -> tuple[int, list[str]]:
-    """删除日志目录内超过保留期的本程序日志，不触碰其他文件。"""
-    if retention_days <= 0 or not log_dir.is_dir():
+def _cleanup_expired_files(
+    directory: Path, pattern: str, retention_days: int
+) -> tuple[int, list[str]]:
+    """按修改时间清理指定目录和文件名模式，不递归、不触碰其他文件。"""
+    if retention_days <= 0 or not directory.is_dir():
         return 0, []
 
     cutoff = time.time() - retention_days * 24 * 60 * 60
     deleted = 0
     errors: list[str] = []
     try:
-        candidates = list(log_dir.glob("auto-cfst-*.log"))
+        candidates = list(directory.glob(pattern))
     except OSError as exc:
-        return 0, [f"无法扫描日志目录 {log_dir}: {exc}"]
+        return 0, [f"无法扫描目录 {directory}: {exc}"]
 
     for path in candidates:
         try:
@@ -936,10 +948,51 @@ def _cleanup_expired_logs(log_dir: Path, retention_days: int) -> tuple[int, list
     return deleted, errors
 
 
+def _cleanup_expired_logs(log_dir: Path, retention_days: int) -> tuple[int, list[str]]:
+    """兼容旧调用：清理本程序生成的日志。"""
+    return _cleanup_expired_files(log_dir, "auto-cfst-*.log", retention_days)
+
+
+def _cleanup_expired_backups(
+    backup_dir: Path, retention_days: int
+) -> tuple[int, list[str]]:
+    """清理本程序生成的订阅备份。"""
+    return _cleanup_expired_files(
+        backup_dir, "subscription-backup-*.yaml", retention_days
+    )
+
+
+def _print_cleanup_result(
+    retention_days: int,
+    deleted_logs: int,
+    deleted_backups: int,
+    errors: list[str],
+) -> None:
+    if retention_days > 0:
+        print(
+            f"文件保留期: {retention_days} 天，本次清理 {deleted_logs} 个过期日志、"
+            f"{deleted_backups} 个过期订阅备份。"
+        )
+    else:
+        print("日志和订阅备份自动清理: 已关闭。")
+    for error in errors:
+        print(f"警告: {error}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    enabled, log_path, log_dir, retention_days = _log_settings(args)
+    enabled, log_path, log_dir, backup_dir, retention_days = _storage_settings(args)
+    deleted_logs, log_cleanup_errors = _cleanup_expired_logs(
+        log_dir, retention_days
+    )
+    deleted_backups, backup_cleanup_errors = _cleanup_expired_backups(
+        backup_dir, retention_days
+    )
+    cleanup_errors = log_cleanup_errors + backup_cleanup_errors
     if not enabled:
+        _print_cleanup_result(
+            retention_days, deleted_logs, deleted_backups, cleanup_errors
+        )
         return _execute_command(args)
 
     try:
@@ -957,15 +1010,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"日志文件: {log_path}")
             print(f"开始时间: {started_at.isoformat(timespec='seconds')}")
             print(f"运行平台: {platform.system()} {platform.machine()}")
-            deleted_logs, cleanup_errors = _cleanup_expired_logs(
-                log_dir, retention_days
+            _print_cleanup_result(
+                retention_days, deleted_logs, deleted_backups, cleanup_errors
             )
-            if retention_days > 0:
-                print(f"日志保留期: {retention_days} 天，本次清理 {deleted_logs} 个过期日志。")
-            else:
-                print("日志自动清理: 已关闭。")
-            for cleanup_error in cleanup_errors:
-                print(f"警告: {cleanup_error}")
             try:
                 exit_code = _execute_command(args)
             except KeyboardInterrupt:

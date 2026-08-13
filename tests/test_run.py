@@ -15,6 +15,7 @@ from auto_cloudflare_speedtest.run import (
     _bundled_executable,
     _build_parser,
     _cleanup_expired_logs,
+    _cleanup_expired_backups,
     _default_ip_file,
     _platform_bundle_name,
     get_sub_content,
@@ -144,6 +145,24 @@ class ExecutionLogTests(unittest.TestCase):
 
             self.assertEqual((deleted, errors), (0, []))
             self.assertTrue(expired.exists())
+
+    def test_backup_cleanup_uses_same_retention_and_safe_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            backup_dir = Path(directory)
+            expired = backup_dir / "subscription-backup-20260101-000000.yaml"
+            recent = backup_dir / "subscription-backup-20260813-000000.yaml"
+            unrelated = backup_dir / "manual-backup.yaml"
+            for path in (expired, recent, unrelated):
+                path.write_text("content", encoding="utf-8")
+            old_time = time.time() - 31 * 24 * 60 * 60
+            os.utime(expired, (old_time, old_time))
+
+            deleted, errors = _cleanup_expired_backups(backup_dir, 30)
+
+            self.assertEqual((deleted, errors), (1, []))
+            self.assertFalse(expired.exists())
+            self.assertTrue(recent.exists())
+            self.assertTrue(unrelated.exists())
 
     def test_carriage_return_progress_keeps_only_last_frame_in_log(self) -> None:
         terminal = io.StringIO()

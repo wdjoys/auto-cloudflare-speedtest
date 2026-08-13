@@ -54,6 +54,8 @@ log_enabled = true
 log_dir = "logs"
 # 日志保留天数；只清理 log_dir 内的 auto-cfst-*.log，0 表示不自动清理。
 log_retention_days = 30
+# 订阅备份目录；备份保留天数与 log_retention_days 相同。
+backup_dir = "backups"
 
 # CloudflareST 测速结果 CSV 文件；每次运行会由测速程序更新。
 result_csv = "result.csv"
