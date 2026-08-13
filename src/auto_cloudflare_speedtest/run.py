@@ -181,9 +181,7 @@ def _platform_bundle_name(
     )
 
 
-def _bundled_executable(
-    system: str | None = None, machine: str | None = None
-) -> Path:
+def _bundled_executable(system: str | None = None, machine: str | None = None) -> Path:
     system_name, architecture = _platform_bundle_name(system, machine)
     filename = "cfst.exe" if system_name == "win" else "cfst"
     return PACKAGE_DIR / "cfst" / f"{system_name}_{architecture}" / filename
@@ -337,7 +335,9 @@ def run_cfst_speedtest(
         stat = result_path.stat()
         current_result = (stat.st_mtime_ns, stat.st_size)
         if previous_result is not None and current_result == previous_result:
-            print(f"错误: CloudflareST 没有更新结果文件，拒绝使用上次残留数据: {result_path}")
+            print(
+                f"错误: CloudflareST 没有更新结果文件，拒绝使用上次残留数据: {result_path}"
+            )
             print("可先降低 --speed-limit，或使用 --debug 查看实际测速结果。")
             return None
         return completed
@@ -459,7 +459,9 @@ def get_sub_content(
             print("错误: 订阅接口没有返回 JSON 对象。")
             return None
         response_data = data.get("data")
-        content = response_data.get("content") if isinstance(response_data, dict) else None
+        content = (
+            response_data.get("content") if isinstance(response_data, dict) else None
+        )
         if not isinstance(content, str):
             print("错误: 响应中缺少字符串字段 data.content。")
             return None
@@ -572,7 +574,7 @@ def replace_server_ips_with_details(
                 f"{match.group('quote')}{match.group('suffix')}"
             )
 
-        content, count = pattern.subn(replacer, content, count=1)
+        content, count = pattern.subn(replacer, content, count=99)
         matched += count
     return content, matched, changes
 
@@ -653,8 +655,12 @@ def _nested(config: dict[str, Any], section: str, key: str, default: Any) -> Any
     return values.get(key, default) if isinstance(values, dict) else default
 
 
-def _value(cli_value: Any, config: dict[str, Any], section: str, key: str, default: Any) -> Any:
-    return cli_value if cli_value is not None else _nested(config, section, key, default)
+def _value(
+    cli_value: Any, config: dict[str, Any], section: str, key: str, default: Any
+) -> Any:
+    return (
+        cli_value if cli_value is not None else _nested(config, section, key, default)
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -665,15 +671,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="运行测速并生成或提交订阅更新")
     run_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    run_parser.add_argument("--url", help="订阅 API 地址（也可使用 CFST_SUBSCRIPTION_URL）")
+    run_parser.add_argument(
+        "--url", help="订阅 API 地址（也可使用 CFST_SUBSCRIPTION_URL）"
+    )
     run_parser.add_argument(
         "--download-url",
         help="客户端订阅下载地址；Sub-Store 地址默认可从管理 API 自动推导",
     )
-    run_parser.add_argument("--token", help="认证令牌（建议使用 CFST_SUBSCRIPTION_TOKEN）")
+    run_parser.add_argument(
+        "--token", help="认证令牌（建议使用 CFST_SUBSCRIPTION_TOKEN）"
+    )
     run_parser.add_argument("--retries", type=int, help="临时网络错误的重试次数")
-    run_parser.add_argument("--retry-delay", type=float, help="首次重试等待秒数，后续指数增加")
-    run_parser.add_argument("--request-timeout", type=float, help="单次 HTTP 请求超时秒数")
+    run_parser.add_argument(
+        "--retry-delay", type=float, help="首次重试等待秒数，后续指数增加"
+    )
+    run_parser.add_argument(
+        "--request-timeout", type=float, help="单次 HTTP 请求超时秒数"
+    )
     run_parser.add_argument("--log-file", type=Path, help="执行日志文件路径")
     run_parser.add_argument("--no-log", action="store_true", help="本次运行不写日志")
     update_mode = run_parser.add_mutually_exclusive_group()
@@ -706,7 +720,9 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validated_positive(name: str, value: int | float, allow_zero: bool = False) -> bool:
+def _validated_positive(
+    name: str, value: int | float, allow_zero: bool = False
+) -> bool:
     valid = value >= 0 if allow_zero else value > 0
     if not valid:
         print(f"错误: {name} 必须为{'非负数' if allow_zero else '正数'}。")
@@ -734,7 +750,9 @@ def check_environment(args: argparse.Namespace) -> ExitCode:
     except (TypeError, ValueError, OSError) as exc:
         print(f"错误: 路径配置无效: {exc}")
         return ExitCode.CONFIG_ERROR
-    url = os.getenv("CFST_SUBSCRIPTION_URL") or _nested(config, "subscription", "url", "")
+    url = os.getenv("CFST_SUBSCRIPTION_URL") or _nested(
+        config, "subscription", "url", ""
+    )
 
     system_name, architecture = _platform_bundle_name()
     executable_ready = executable.is_file() and (
@@ -766,15 +784,25 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
         return ExitCode.CONFIG_ERROR
 
     base_dir = config_path.parent
-    url = args.url or os.getenv("CFST_SUBSCRIPTION_URL") or _nested(config, "subscription", "url", "")
-    token = args.token or os.getenv("CFST_SUBSCRIPTION_TOKEN") or _nested(config, "subscription", "token", "")
+    url = (
+        args.url
+        or os.getenv("CFST_SUBSCRIPTION_URL")
+        or _nested(config, "subscription", "url", "")
+    )
+    token = (
+        args.token
+        or os.getenv("CFST_SUBSCRIPTION_TOKEN")
+        or _nested(config, "subscription", "token", "")
+    )
     configured_download_url = (
         args.download_url
         or os.getenv("CFST_SUBSCRIPTION_DOWNLOAD_URL")
         or _nested(config, "subscription", "download_url", "")
     )
     if not isinstance(url, str) or not url:
-        print("错误: 未配置订阅 URL。请复制 config.example.toml 为 config.toml 并填写 url，")
+        print(
+            "错误: 未配置订阅 URL。请复制 config.example.toml 为 config.toml 并填写 url，"
+        )
         print("或使用 --url / CFST_SUBSCRIPTION_URL。")
         return ExitCode.CONFIG_ERROR
     if not url.lower().startswith(("http://", "https://")):
@@ -802,7 +830,13 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
             _value(args.request_timeout, config, "subscription", "request_timeout", 30)
         )
         executable = _resolve_path(
-            _value(args.executable, config, "speedtest", "executable", _default_executable()),
+            _value(
+                args.executable,
+                config,
+                "speedtest",
+                "executable",
+                _default_executable(),
+            ),
             base_dir,
         )
         ip_file = _resolve_path(
@@ -1100,9 +1134,7 @@ def _print_cleanup_result(
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     enabled, log_path, log_dir, backup_dir, retention_days = _storage_settings(args)
-    deleted_logs, log_cleanup_errors = _cleanup_expired_logs(
-        log_dir, retention_days
-    )
+    deleted_logs, log_cleanup_errors = _cleanup_expired_logs(log_dir, retention_days)
     deleted_backups, backup_cleanup_errors = _cleanup_expired_backups(
         backup_dir, retention_days
     )
