@@ -90,6 +90,11 @@ uv run auto-cfst run --help
 - `--ip-file`：IPv4 或 IPv6 地址段文件路径
 - `--result`：测速 CSV 路径
 - `--output`：更新后 YAML 路径
+- `--retries`：连接重置、超时、429 和 5xx 等临时错误的重试次数
+- `--retry-delay`：首次重试等待秒数，后续按指数退避
+- `--request-timeout`：单次订阅读取或更新请求的超时时间
+- `--log-file`：将本次执行日志写入指定文件
+- `--no-log`：本次不写执行日志
 - `--debug`：显示 CloudflareST 下载失败原因，仅限预览模式
 - `--apply`：提交远程更新；未指定时只生成本地预览
 
@@ -117,6 +122,27 @@ uv run auto-cfst run --help
 说明没有 IP 达到当前的下载速度下限。先使用配置中的 `0.01 MB/s` 再试；如仍无结果，
 运行 `uv run auto-cfst run --debug` 查看 CloudflareST 给出的下载失败原因。调试模式只用于
 诊断，不能与 `--apply` 一起使用。
+
+**出现 `Connection reset by peer`**
+
+这是订阅服务器或中间网络临时断开连接。程序默认会自动重试 5 次，等待时间依次为
+2、4、8、15、15 秒；HTTP 4xx 配置或权限错误不会盲目重试。可在配置文件中调整
+`retries`、`retry_delay` 和 `request_timeout`。
+
+## 执行日志
+
+日志默认开启，每次运行会在 `logs/` 中生成独立的带时间戳文件，同时保留终端实时输出。
+日志包括网络重试、测速进度、替换结果、退出码和耗时，不会写入订阅正文或认证令牌。
+CloudflareST 使用回车覆盖同一行刷新进度；日志会压缩这些动态帧，只保留每个阶段换行前的
+最终进度，避免生成一整行重复进度条。
+
+```bash
+# 指定日志文件
+python3 src/auto_cloudflare_speedtest/run.py run --log-file /var/log/auto-cfst.log
+
+# 本次关闭日志
+python3 src/auto_cloudflare_speedtest/run.py run --no-log
+```
 
 ## 开发与测试
 

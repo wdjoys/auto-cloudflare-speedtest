@@ -10,6 +10,13 @@ url = ""
 # 或取消下一行注释并填写令牌（请勿将包含真实令牌的配置文件提交到仓库）。
 # token = "your-token"
 
+# 临时网络错误重试次数；0 表示不重试。
+retries = 5
+# 首次重试等待秒数；后续指数增加，单次最多等待 15 秒。
+retry_delay = 2
+# 单次 HTTP 请求超时秒数。
+request_timeout = 30
+
 [speedtest]
 # CloudflareST 可执行文件路径。默认不配置，程序会根据操作系统和 CPU 架构，
 # 自动选择 cfst/<平台>_<架构>/cfst[.exe]；只有使用外部程序时才取消下一行注释。
@@ -41,6 +48,11 @@ display_count = 0
 debug = false
 
 [output]
+# 是否记录脚本及 CloudflareST 的完整执行日志。
+log_enabled = true
+# 带时间戳的日志文件保存目录。
+log_dir = "logs"
+
 # CloudflareST 测速结果 CSV 文件；每次运行会由测速程序更新。
 result_csv = "result.csv"
 

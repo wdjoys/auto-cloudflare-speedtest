@@ -45,6 +45,7 @@ htmlcov/
 result.csv
 updated_sub.yaml
 subscription-backup-*.yaml
+logs/
 *.log
 *.tmp
 *.temp

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import codecs
+import contextlib
 import csv
+import http.client
 import ipaddress
 import json
 import os
@@ -11,13 +14,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TextIO
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -31,6 +35,54 @@ class ExitCode(IntEnum):
     SUBSCRIPTION_READ_FAILED = 3
     REPLACE_FAILED = 4
     SUBSCRIPTION_UPDATE_FAILED = 5
+
+
+class TeeTextIO:
+    """将文本写入终端，并把回车式动态进度压缩后写入日志。"""
+
+    ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+    def __init__(self, terminal: TextIO, log_file: TextIO) -> None:
+        self.terminal = terminal
+        self.log_file = log_file
+        self._pending_line = ""
+
+    def write(self, text: str) -> int:
+        self.terminal.write(text)
+        for character in text:
+            if character == "\r":
+                # 终端中的 \r 表示回到行首覆盖进度；日志只保留覆盖后的最新一帧。
+                self._pending_line = ""
+            elif character == "\n":
+                self._write_pending_line()
+            elif character == "\b":
+                self._pending_line = self._pending_line[:-1]
+            else:
+                self._pending_line += character
+        return len(text)
+
+    def _write_pending_line(self) -> None:
+        clean_line = self.ANSI_ESCAPE.sub("", self._pending_line).rstrip()
+        self.log_file.write(f"{clean_line}\n")
+        self._pending_line = ""
+
+    def finalize(self) -> None:
+        """将最后一行写入日志，避免无换行输出丢失。"""
+        if self._pending_line:
+            self._write_pending_line()
+        self.log_file.flush()
+
+    def flush(self) -> None:
+        self.terminal.flush()
+        # 不提交半行内容；CloudflareST 每个进度字符都会触发 flush。
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return self.terminal.isatty()
+
+    @property
+    def encoding(self) -> str | None:
+        return self.terminal.encoding
 
 
 def _platform_bundle_name(
@@ -189,7 +241,28 @@ def run_cfst_speedtest(
             stat = result_path.stat()
             previous_result = (stat.st_mtime_ns, stat.st_size)
 
-        completed = subprocess.run(command, check=True, cwd=result_path.parent)
+        process = subprocess.Popen(
+            command,
+            cwd=result_path.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+        if process.stdout is not None:
+            # 二进制读取避免 TextIOWrapper 将 \r 自动转换成 \n；增量解码避免中文被截断。
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            while chunk := process.stdout.read(1024):
+                decoded = decoder.decode(chunk)
+                if decoded:
+                    print(decoded, end="", flush=True)
+            remaining = decoder.decode(b"", final=True)
+            if remaining:
+                print(remaining, end="", flush=True)
+        return_code = process.wait()
+        completed = subprocess.CompletedProcess(command, return_code)
+        if return_code != 0:
+            print(f"错误: CloudflareST 执行失败，退出码: {return_code}")
+            return None
         if not result_path.is_file():
             print("错误: CloudflareST 没有生成结果文件。")
             print(
@@ -208,8 +281,6 @@ def run_cfst_speedtest(
         return completed
     except FileNotFoundError:
         print(f"错误: 无法执行文件: {executable}")
-    except subprocess.CalledProcessError as exc:
-        print(f"错误: CloudflareST 执行失败，退出码: {exc.returncode}")
     except OSError as exc:
         print(f"错误: 启动 CloudflareST 失败: {exc}")
     return None
@@ -254,13 +325,65 @@ def _request_headers(token: str | None = None) -> dict[str, str]:
     return headers
 
 
-def get_sub_content(url: str, token: str | None = None) -> Optional[dict[str, Any]]:
+RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_request_error(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in RETRYABLE_HTTP_STATUS
+    if isinstance(exc, urllib.error.URLError):
+        # 包括 DNS 临时失败、连接重置、拒绝连接和超时。
+        return True
+    return isinstance(
+        exc,
+        (TimeoutError, ConnectionError, http.client.HTTPException),
+    )
+
+
+def _request_with_retry(
+    request_factory: Any,
+    *,
+    timeout: float,
+    retries: int,
+    retry_delay: float,
+    operation: str,
+) -> tuple[int, bytes]:
+    """执行 HTTP 请求，仅针对可能恢复的网络错误进行指数退避重试。"""
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request_factory(), timeout=timeout) as response:
+                return response.status, response.read()
+        except Exception as exc:
+            if attempt >= retries or not _is_retryable_request_error(exc):
+                raise
+            wait_seconds = min(retry_delay * (2**attempt), 15.0)
+            print(
+                f"警告: {operation}失败: {exc}；{wait_seconds:g} 秒后重试 "
+                f"({attempt + 1}/{retries})..."
+            )
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+    raise RuntimeError("请求重试流程异常结束")
+
+
+def get_sub_content(
+    url: str,
+    token: str | None = None,
+    retries: int = 5,
+    retry_delay: float = 2,
+    timeout: float = 30,
+) -> Optional[dict[str, Any]]:
     """读取远程订阅 JSON。"""
     print(f"正在获取订阅内容: {url}")
     try:
-        request = urllib.request.Request(url, headers=_request_headers(token))
-        with urllib.request.urlopen(request, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        _, response_body = _request_with_retry(
+            lambda: urllib.request.Request(url, headers=_request_headers(token)),
+            timeout=timeout,
+            retries=retries,
+            retry_delay=retry_delay,
+            operation="获取订阅",
+        )
+        data = json.loads(response_body.decode("utf-8"))
         if not isinstance(data, dict):
             print("错误: 订阅接口没有返回 JSON 对象。")
             return None
@@ -310,22 +433,33 @@ def replace_server_ips(content: str, ips: list[str]) -> str:
 
 
 def update_subscription(
-    content: dict[str, Any], url: str, token: str | None = None
+    content: dict[str, Any],
+    url: str,
+    token: str | None = None,
+    retries: int = 5,
+    retry_delay: float = 2,
+    timeout: float = 30,
 ) -> bool:
     """通过 PATCH 更新远程订阅。"""
     headers = _request_headers(token)
     headers["Content-Type"] = "application/json; charset=utf-8"
-    request = urllib.request.Request(
-        url=url,
-        data=json.dumps(content, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="PATCH",
-    )
+    data_bytes = json.dumps(content, ensure_ascii=False).encode("utf-8")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            if 200 <= response.status < 300:
-                return True
-            print(f"错误: 更新订阅失败，HTTP 状态码: {response.status}")
+        status, _ = _request_with_retry(
+            lambda: urllib.request.Request(
+                url=url,
+                data=data_bytes,
+                headers=headers,
+                method="PATCH",
+            ),
+            timeout=timeout,
+            retries=retries,
+            retry_delay=retry_delay,
+            operation="更新订阅",
+        )
+        if 200 <= status < 300:
+            return True
+        print(f"错误: 更新订阅失败，HTTP 状态码: {status}")
     except urllib.error.HTTPError as exc:
         print(f"错误: 更新订阅失败，HTTP {exc.code}: {exc.reason}")
     except urllib.error.URLError as exc:
@@ -356,6 +490,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     run_parser.add_argument("--url", help="订阅 API 地址（也可使用 CFST_SUBSCRIPTION_URL）")
     run_parser.add_argument("--token", help="认证令牌（建议使用 CFST_SUBSCRIPTION_TOKEN）")
+    run_parser.add_argument("--retries", type=int, help="临时网络错误的重试次数")
+    run_parser.add_argument("--retry-delay", type=float, help="首次重试等待秒数，后续指数增加")
+    run_parser.add_argument("--request-timeout", type=float, help="单次 HTTP 请求超时秒数")
+    run_parser.add_argument("--log-file", type=Path, help="执行日志文件路径")
+    run_parser.add_argument("--no-log", action="store_true", help="本次运行不写日志")
     update_mode = run_parser.add_mutually_exclusive_group()
     update_mode.add_argument("--apply", action="store_true", help="将修改提交到远程")
     update_mode.add_argument(
@@ -381,6 +520,8 @@ def _build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     check_parser.add_argument("--executable", help="CloudflareST 可执行文件路径")
     check_parser.add_argument("--ip-file", help="IP 段文件路径")
+    check_parser.add_argument("--log-file", type=Path, help="执行日志文件路径")
+    check_parser.add_argument("--no-log", action="store_true", help="本次检查不写日志")
     return parser
 
 
@@ -458,6 +599,13 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
         return ExitCode.CONFIG_ERROR
 
     try:
+        retries = int(_value(args.retries, config, "subscription", "retries", 5))
+        retry_delay = float(
+            _value(args.retry_delay, config, "subscription", "retry_delay", 2)
+        )
+        request_timeout = float(
+            _value(args.request_timeout, config, "subscription", "request_timeout", 30)
+        )
         executable = _resolve_path(
             _value(args.executable, config, "speedtest", "executable", _default_executable()),
             base_dir,
@@ -499,6 +647,9 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
         return ExitCode.CONFIG_ERROR
 
     validations = [
+        _validated_positive("retries", retries, allow_zero=True),
+        _validated_positive("retry_delay", retry_delay, allow_zero=True),
+        _validated_positive("request_timeout", request_timeout),
         _validated_positive("threads", threads),
         _validated_positive("latency", latency),
         _validated_positive("download_count", download_count),
@@ -512,7 +663,13 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
         print("请先以预览模式诊断，再调整 speed_limit 后正常运行。")
         return ExitCode.CONFIG_ERROR
 
-    subscription = get_sub_content(url, token or None)
+    subscription = get_sub_content(
+        url,
+        token or None,
+        retries=retries,
+        retry_delay=retry_delay,
+        timeout=request_timeout,
+    )
     if subscription is None:
         return ExitCode.SUBSCRIPTION_READ_FAILED
     original_content = subscription["data"]["content"]
@@ -566,17 +723,86 @@ def run_pipeline(args: argparse.Namespace) -> ExitCode:
     print(f"远程更新前的原内容已备份到: {backup_file}")
 
     subscription["data"]["content"] = updated_content
-    if not update_subscription(subscription["data"], url, token or None):
+    if not update_subscription(
+        subscription["data"],
+        url,
+        token or None,
+        retries=retries,
+        retry_delay=retry_delay,
+        timeout=request_timeout,
+    ):
         return ExitCode.SUBSCRIPTION_UPDATE_FAILED
     print("订阅更新成功。")
     return ExitCode.OK
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+def _execute_command(args: argparse.Namespace) -> int:
     if args.command == "check":
         return int(check_environment(args))
     return int(run_pipeline(args))
+
+
+def _log_settings(args: argparse.Namespace) -> tuple[bool, Path]:
+    """读取日志设置；日志自身初始化失败不能阻止核心任务执行。"""
+    config_path = _resolve_path(args.config)
+    try:
+        config = load_config(config_path)
+    except ValueError:
+        config = {}
+    enabled_value = _nested(config, "output", "log_enabled", True)
+    enabled = enabled_value if isinstance(enabled_value, bool) else True
+    if args.no_log:
+        enabled = False
+
+    if args.log_file is not None:
+        log_path = _resolve_path(args.log_file, config_path.parent)
+    else:
+        log_dir_value = _nested(config, "output", "log_dir", "logs")
+        try:
+            log_dir = _resolve_path(log_dir_value, config_path.parent)
+        except (TypeError, ValueError, OSError):
+            log_dir = _resolve_path("logs", config_path.parent)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        log_path = log_dir / f"auto-cfst-{timestamp}.log"
+    return enabled, log_path
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    enabled, log_path = _log_settings(args)
+    if not enabled:
+        return _execute_command(args)
+
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("a", encoding="utf-8", buffering=1)
+    except OSError as exc:
+        print(f"警告: 无法创建日志文件 {log_path}: {exc}")
+        return _execute_command(args)
+
+    started_at = datetime.now()
+    with log_file:
+        stdout = TeeTextIO(sys.stdout, log_file)
+        stderr = TeeTextIO(sys.stderr, log_file)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            print(f"日志文件: {log_path}")
+            print(f"开始时间: {started_at.isoformat(timespec='seconds')}")
+            print(f"运行平台: {platform.system()} {platform.machine()}")
+            try:
+                exit_code = _execute_command(args)
+            except KeyboardInterrupt:
+                print("\n执行被用户中断。")
+                exit_code = 130
+            # 避免子进程最后一行无换行时与结束元数据粘连。
+            stdout.finalize()
+            stderr.finalize()
+            finished_at = datetime.now()
+            elapsed = (finished_at - started_at).total_seconds()
+            print(f"结束时间: {finished_at.isoformat(timespec='seconds')}")
+            print(f"退出码: {exit_code}，耗时: {elapsed:.1f} 秒")
+            stdout.finalize()
+            stderr.finalize()
+            return exit_code
 
 
 if __name__ == "__main__":

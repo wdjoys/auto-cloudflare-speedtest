@@ -1,22 +1,127 @@
 import csv
+import io
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
 from auto_cloudflare_speedtest.run import (
     ExitCode,
+    TeeTextIO,
     _bundled_executable,
     _build_parser,
     _default_ip_file,
     _platform_bundle_name,
+    get_sub_content,
     extract_ips_from_csv,
     load_config,
+    main,
     replace_server_ips,
     replace_server_ips_with_count,
     run_pipeline,
 )
+
+
+class FakeHttpResponse:
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self._body = io.BytesIO(body)
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body.read()
+
+
+class RequestRetryTests(unittest.TestCase):
+    def test_retries_connection_reset_then_succeeds(self) -> None:
+        response = FakeHttpResponse(b'{"data":{"content":"ok"}}')
+        error = urllib.error.URLError(ConnectionResetError(104, "reset"))
+        with (
+            patch(
+                "auto_cloudflare_speedtest.run.urllib.request.urlopen",
+                side_effect=[error, response],
+            ) as urlopen,
+            patch("auto_cloudflare_speedtest.run.time.sleep") as sleep,
+        ):
+            result = get_sub_content(
+                "https://example.com", retries=1, retry_delay=2, timeout=10
+            )
+
+        self.assertEqual(result, {"data": {"content": "ok"}})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_does_not_retry_non_transient_http_error(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://example.com", 401, "Unauthorized", {}, None
+        )
+        with (
+            patch(
+                "auto_cloudflare_speedtest.run.urllib.request.urlopen",
+                side_effect=error,
+            ) as urlopen,
+            patch("auto_cloudflare_speedtest.run.time.sleep") as sleep,
+        ):
+            result = get_sub_content("https://example.com", retries=5, retry_delay=2)
+
+        self.assertIsNone(result)
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+
+class ExecutionLogTests(unittest.TestCase):
+    def test_carriage_return_progress_keeps_only_last_frame_in_log(self) -> None:
+        terminal = io.StringIO()
+        log = io.StringIO()
+        output = TeeTextIO(terminal, log)
+
+        output.write("开始测速\n")
+        output.write("0 / 100 可用: 0\r")
+        output.write("50 / 100 可用: 45\r")
+        output.write("100 / 100 可用: 90\n")
+        output.finalize()
+
+        self.assertIn("0 / 100", terminal.getvalue())
+        self.assertEqual(log.getvalue(), "开始测速\n100 / 100 可用: 90\n")
+
+    def test_main_writes_metadata_and_command_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.toml"
+            log_path = root / "execution.log"
+            config_path.write_text("", encoding="utf-8")
+
+            def fake_execute(_args) -> int:
+                print("测试命令输出")
+                return 0
+
+            with patch(
+                "auto_cloudflare_speedtest.run._execute_command",
+                side_effect=fake_execute,
+            ):
+                exit_code = main(
+                    [
+                        "check",
+                        "--config",
+                        str(config_path),
+                        "--log-file",
+                        str(log_path),
+                    ]
+                )
+
+            content = log_path.read_text(encoding="utf-8")
+            self.assertEqual(exit_code, 0)
+            self.assertIn("测试命令输出", content)
+            self.assertIn("开始时间:", content)
+            self.assertIn("运行平台:", content)
+            self.assertIn("退出码: 0", content)
 
 
 class PlatformSelectionTests(unittest.TestCase):
