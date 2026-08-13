@@ -38,43 +38,93 @@ class ExitCode(IntEnum):
 
 
 class TeeTextIO:
-    """将文本写入终端，并把回车式动态进度压缩后写入日志。"""
+    """将普通文本双写，并将 CloudflareST 动态进度压缩成最终状态。"""
 
     ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    PROGRESS_START = re.compile(r"(?<!\d)\d+\s*/\s*\d+\s*\[")
 
     def __init__(self, terminal: TextIO, log_file: TextIO) -> None:
         self.terminal = terminal
         self.log_file = log_file
         self._pending_line = ""
+        self._latest_progress: str | None = None
+        self._progress_visible = False
 
     def write(self, text: str) -> int:
-        self.terminal.write(text)
         for character in text:
             if character == "\r":
-                # 终端中的 \r 表示回到行首覆盖进度；日志只保留覆盖后的最新一帧。
-                self._pending_line = ""
+                self._consume_line(is_carriage_return=True)
             elif character == "\n":
-                self._write_pending_line()
+                self._consume_line(is_carriage_return=False)
             elif character == "\b":
                 self._pending_line = self._pending_line[:-1]
             else:
                 self._pending_line += character
         return len(text)
 
-    def _write_pending_line(self) -> None:
-        clean_line = self.ANSI_ESCAPE.sub("", self._pending_line).rstrip()
-        self.log_file.write(f"{clean_line}\n")
+    def _clean_line(self, line: str) -> str:
+        return self.ANSI_ESCAPE.sub("", line).rstrip()
+
+    def _extract_progress(self, line: str) -> str | None:
+        """提取最后一个进度帧，兼容多个帧被拼在同一行的情况。"""
+        matches = list(self.PROGRESS_START.finditer(line))
+        if not matches:
+            return None
+        return line[matches[-1].start() :].strip()
+
+    def _render_progress(self, progress: str) -> None:
+        if not self.terminal.isatty():
+            return
+        # \x1b[K 清除旧进度行较长时残留在右侧的字符。
+        self.terminal.write(f"\r{progress}\x1b[K")
+        self.terminal.flush()
+        self._progress_visible = True
+
+    def _commit_progress(self) -> None:
+        if self._latest_progress is None:
+            return
+        if self.terminal.isatty():
+            self.terminal.write(f"\r{self._latest_progress}\x1b[K\n")
+        else:
+            self.terminal.write(f"{self._latest_progress}\n")
+        self.log_file.write(f"{self._latest_progress}\n")
+        self._latest_progress = None
+        self._progress_visible = False
+
+    def _consume_line(self, *, is_carriage_return: bool) -> None:
+        clean_line = self._clean_line(self._pending_line)
         self._pending_line = ""
+
+        progress = self._extract_progress(clean_line)
+        if progress is not None:
+            self._latest_progress = progress
+            self._render_progress(progress)
+            # CRLF 或测速程序在最终帧后输出换行时，落盘最终进度。
+            if not is_carriage_return and clean_line == "":
+                self._commit_progress()
+            return
+
+        committed_progress = self._latest_progress is not None
+        if committed_progress:
+            self._commit_progress()
+
+        # 空行只负责结束动态进度时，不额外制造一行。
+        if not clean_line and (is_carriage_return or committed_progress):
+            return
+        self.terminal.write(f"{clean_line}\n")
+        self.log_file.write(f"{clean_line}\n")
 
     def finalize(self) -> None:
         """将最后一行写入日志，避免无换行输出丢失。"""
         if self._pending_line:
-            self._write_pending_line()
+            self._consume_line(is_carriage_return=False)
+        self._commit_progress()
+        self.terminal.flush()
         self.log_file.flush()
 
     def flush(self) -> None:
         self.terminal.flush()
-        # 不提交半行内容；CloudflareST 每个进度字符都会触发 flush。
+        # 不提交半行或动态进度；阶段结束或 finalize 时才写入日志。
         self.log_file.flush()
 
     def isatty(self) -> bool:

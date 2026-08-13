@@ -3,7 +3,7 @@
 
 [subscription]
 # 订阅管理接口地址；沿用原脚本中内置的 GET/PATCH API 地址。 sub-store 订阅
-url = ""
+url = "https://sub.store/store密码/api/sub/订阅名称"
 
 # 接口认证令牌；原脚本没有配置令牌，因此默认不启用。
 # 如接口需要认证，推荐设置环境变量 CFST_SUBSCRIPTION_TOKEN，

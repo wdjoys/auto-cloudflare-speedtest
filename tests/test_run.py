@@ -83,13 +83,39 @@ class ExecutionLogTests(unittest.TestCase):
         output = TeeTextIO(terminal, log)
 
         output.write("开始测速\n")
-        output.write("0 / 100 可用: 0\r")
-        output.write("50 / 100 可用: 45\r")
-        output.write("100 / 100 可用: 90\n")
+        output.write("0 / 100 [___] 可用: 0\r")
+        output.write("50 / 100 [-__] 可用: 45\r")
+        output.write("100 / 100 [---] 可用: 90\n")
         output.finalize()
 
-        self.assertIn("0 / 100", terminal.getvalue())
-        self.assertEqual(log.getvalue(), "开始测速\n100 / 100 可用: 90\n")
+        self.assertEqual(terminal.getvalue(), "开始测速\n100 / 100 [---] 可用: 90\n")
+        self.assertEqual(log.getvalue(), "开始测速\n100 / 100 [---] 可用: 90\n")
+
+    def test_newline_progress_is_also_collapsed(self) -> None:
+        terminal = io.StringIO()
+        log = io.StringIO()
+        output = TeeTextIO(terminal, log)
+
+        output.write("0 / 100 [___] 可用: 0\n")
+        output.write("50 / 100 [-__] 可用: 45\n")
+        output.write("100 / 100 [---] 可用: 90\n")
+        output.write("开始下载测速\n")
+        output.finalize()
+
+        self.assertEqual(
+            log.getvalue().splitlines(),
+            ["100 / 100 [---] 可用: 90", "开始下载测速"],
+        )
+
+    def test_concatenated_progress_keeps_last_frame(self) -> None:
+        terminal = io.StringIO()
+        log = io.StringIO()
+        output = TeeTextIO(terminal, log)
+
+        output.write("0 / 100 [___] 可用: 0  50 / 100 [-__] 可用: 45\n")
+        output.finalize()
+
+        self.assertEqual(log.getvalue(), "50 / 100 [-__] 可用: 45\n")
 
     def test_main_writes_metadata_and_command_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
